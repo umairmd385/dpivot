@@ -1,0 +1,22 @@
+version: "3.9"
+
+# Multi-port example: nginx serving HTTP on :80 and HTTPS on :443.
+# dpivot injects one proxy with two listeners, one per port.
+#
+# Generated DPIVOT_BINDS: "80:80,443:443"
+# Generated proxy ports: ["80:80", "443:443"]
+
+services:
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 10s
+      retries: 3
+    restart: unless-stopped

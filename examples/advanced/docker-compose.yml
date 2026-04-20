@@ -1,0 +1,56 @@
+version: "3.9"
+
+# Multi-service stack with:
+# - Two app services (auto-detected for proxy)
+# - Redis (auto-excluded: cache image)
+# - A worker (no ports, not proxied)
+# - x-dpivot: skip: true on the internal admin service
+#
+# After dpivot generate, you get:
+#   dpivot-proxy-api  owns :3000
+#   dpivot-proxy-web  owns :80
+#   worker, redis, admin passed through unchanged
+
+services:
+  api:
+    image: myapp:1.0
+    ports:
+      - "3000:3000"
+    environment:
+      REDIS_URL: redis://redis:6379
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/ready"]
+      interval: 10s
+      retries: 3
+    restart: unless-stopped
+
+  web:
+    image: my-frontend:latest
+    ports:
+      - "80:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 15s
+      retries: 3
+    restart: unless-stopped
+
+  worker:
+    image: myapp:1.0
+    command: ["node", "worker.js"]
+    environment:
+      REDIS_URL: redis://redis:6379
+    restart: unless-stopped
+    # No ports → dpivot passes this through unchanged
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Redis is in the excluded database list → passed through unchanged
+
+  admin:
+    image: admin-panel:latest
+    ports:
+      - "9000:9000"
+    x-dpivot:
+      skip: true    # internal tool, not worth proxying
+    restart: unless-stopped
