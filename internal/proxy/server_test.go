@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dpivot/dpivot/internal/metrics"
 	"github.com/dpivot/dpivot/internal/proxy"
 	"go.uber.org/zap"
 )
@@ -51,7 +52,7 @@ func newTestServer(t *testing.T) (*proxy.Registry, *proxy.Server) {
 	t.Helper()
 	reg := proxy.NewRegistry()
 	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, nopLogger())
+	srv := proxy.NewServer(router, nopLogger(), metrics.New())
 	t.Cleanup(srv.Close)
 	return reg, srv
 }

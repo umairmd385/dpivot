@@ -8,18 +8,20 @@ import (
 	"testing"
 
 	dpivotapi "github.com/dpivot/dpivot/internal/api"
+	"github.com/dpivot/dpivot/internal/metrics"
 	"github.com/dpivot/dpivot/internal/proxy"
 	"go.uber.org/zap"
 )
 
 func newTestAPI(t *testing.T) (*proxy.Registry, *httptest.Server) {
 	t.Helper()
+	m := metrics.New()
 	reg := proxy.NewRegistry()
 	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, zap.NewNop())
+	srv := proxy.NewServer(router, zap.NewNop(), m)
 	t.Cleanup(srv.Close)
 
-	cs := dpivotapi.NewControlServer(reg, srv, zap.NewNop())
+	cs := dpivotapi.NewControlServer(reg, srv, zap.NewNop(), m)
 	ts := httptest.NewServer(cs.Handler())
 	t.Cleanup(ts.Close)
 	return reg, ts
@@ -48,6 +50,76 @@ func TestAPI_Health_WrongMethod(t *testing.T) {
 	resp, _ := http.Post(ts.URL+"/health", "application/json", nil)
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("health POST: want 405, got %d", resp.StatusCode)
+	}
+}
+
+// ── /health/live ──────────────────────────────────────────────────────────────
+
+func TestAPI_HealthLive(t *testing.T) {
+	_, ts := newTestAPI(t)
+	resp, err := http.Get(ts.URL + "/health/live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("health/live: status %d, want 200", resp.StatusCode)
+	}
+	var body map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&body) //nolint:errcheck
+	if body["status"] != "ok" {
+		t.Errorf("health/live.status = %v, want ok", body["status"])
+	}
+}
+
+// ── /health/ready ─────────────────────────────────────────────────────────────
+
+func TestAPI_HealthReady_NoBackends_Returns503(t *testing.T) {
+	_, ts := newTestAPI(t) // empty registry
+	resp, err := http.Get(ts.URL + "/health/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("health/ready with no backends: want 503, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPI_HealthReady_WithBackend_Returns200(t *testing.T) {
+	reg, ts := newTestAPI(t)
+	reg.Add(proxy.Backend{ID: "b1", Addr: "10.0.0.1:8080"}) //nolint:errcheck
+	resp, err := http.Get(ts.URL + "/health/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("health/ready with backend: want 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPI_HealthReady_DrainingOnly_Returns503(t *testing.T) {
+	reg, ts := newTestAPI(t)
+	reg.Add(proxy.Backend{ID: "b1", Addr: "10.0.0.1:8080"}) //nolint:errcheck
+	reg.SetDraining("b1")                                    //nolint:errcheck
+	resp, _ := http.Get(ts.URL + "/health/ready")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("health/ready draining-only: want 503, got %d", resp.StatusCode)
+	}
+}
+
+// ── /metrics ──────────────────────────────────────────────────────────────────
+
+func TestAPI_Metrics_Returns200(t *testing.T) {
+	_, ts := newTestAPI(t)
+	resp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("metrics: want 200, got %d", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		t.Error("metrics: expected Content-Type header")
 	}
 }
 

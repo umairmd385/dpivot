@@ -22,6 +22,7 @@ import (
 
 	"github.com/dpivot/dpivot/internal/api"
 	"github.com/dpivot/dpivot/internal/compose"
+	"github.com/dpivot/dpivot/internal/metrics"
 	"github.com/dpivot/dpivot/internal/plugin"
 	"github.com/dpivot/dpivot/internal/proxy"
 	"github.com/dpivot/dpivot/internal/rollout"
@@ -62,13 +63,15 @@ No external proxy (Traefik, nginx) required.
 Example:
   dpivot generate                       # enhance docker-compose.yml
   docker compose -f dpivot-compose.yml up -d
-  dpivot rollout web                    # roll out a new version of 'web'`,
+  dpivot rollout web                    # roll out a new version of 'web'
+  dpivot rollback web                   # restore previous version if deploy fails`,
 		SilenceUsage: true,
 	}
 
 	root.AddCommand(
 		generateCmd(log),
 		rolloutCmd(log),
+		rollbackCmd(log),
 		statusCmd(log),
 		scaleCmd(log),
 		proxyCmd(log),
@@ -147,13 +150,18 @@ func rolloutCmd(log *zap.Logger) *cobra.Command {
 		Long: `Performs a zero-downtime rolling update for the named service.
 
 Steps:
-  1. Optional: pull latest image
-  2. Scale service +1 (start new container)
-  3. Wait for new container healthcheck to pass
-  4. Register new container with the dpivot proxy
-  5. Drain period — in-flight requests complete
-  6. Deregister old container from proxy
-  7. Scale back to original count
+  1. Acquire rollout lock (prevents concurrent rollouts for the same service)
+  2. Optional: pull latest image
+  3. Scale service +1 (start new container)
+  4. Wait for new container healthcheck to pass
+  5. Register new container with the dpivot proxy
+  6. Save rollout state to /tmp (enables rollback if deploy fails)
+  7. Drain period — in-flight requests complete on old container
+  8. Deregister old container from proxy
+  9. Scale back to original count
+
+If the new container fails its healthcheck within --timeout, dpivot scales
+back to 1 automatically without disrupting traffic.
 
 Example:
   dpivot rollout web
@@ -186,6 +194,58 @@ Example:
 	cmd.Flags().DurationVarP(&opts.Drain, "drain", "d", 5*time.Second, "Drain period before removing old container")
 	cmd.Flags().StringVar(&opts.ControlAddr, "control-addr", "http://localhost:9900", "Proxy control API address")
 	cmd.Flags().StringVar(&opts.APIToken, "api-token", os.Getenv("DPIVOT_API_TOKEN"), "Control API bearer token")
+	return cmd
+}
+
+// ── rollback ──────────────────────────────────────────────────────────────────
+
+func rollbackCmd(log *zap.Logger) *cobra.Command {
+	var controlAddr, apiToken string
+	var drain time.Duration
+
+	cmd := &cobra.Command{
+		Use:   "rollback <service>",
+		Short: "Restore traffic to the previous version after a failed rollout",
+		Long: `Reads the last rollout state for the service, re-registers the old
+backend with the proxy, drains the new (failing) backend, and removes it.
+
+The rollout command saves a state file to /tmp/dpivot-<service>-state.json
+between the point the new backend is registered and the old one is removed.
+If the new deployment fails, run this command immediately to restore traffic.
+
+Example:
+  dpivot rollback web
+  dpivot rollback web --drain 15s
+  dpivot rollback web --control-addr http://localhost:9901`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			service := args[0]
+			state, err := rollout.LoadState(service)
+			if err != nil {
+				return err
+			}
+			// Allow flag overrides.
+			if controlAddr != "" {
+				state.ControlAddr = controlAddr
+			}
+			if apiToken != "" {
+				state.APIToken = apiToken
+			}
+			if drain != 0 {
+				state.Drain = drain
+			}
+
+			ctx, cancel := signal.NotifyContext(context.Background(),
+				syscall.SIGTERM, syscall.SIGINT)
+			defer cancel()
+
+			return rollout.Rollback(ctx, state, log)
+		},
+	}
+
+	cmd.Flags().StringVar(&controlAddr, "control-addr", "", "Override proxy control API address from state")
+	cmd.Flags().StringVar(&apiToken, "api-token", os.Getenv("DPIVOT_API_TOKEN"), "Control API bearer token")
+	cmd.Flags().DurationVarP(&drain, "drain", "d", 0, "Override drain period from state")
 	return cmd
 }
 
@@ -260,9 +320,11 @@ func proxyCmd(log *zap.Logger) *cobra.Command {
 }
 
 func runProxy(log *zap.Logger) error {
+	m := metrics.New()
+
 	reg := proxy.NewRegistry()
 	router := proxy.NewRouter(reg)
-	srv := proxy.NewServer(router, log)
+	srv := proxy.NewServer(router, log, m)
 
 	// Parse DPIVOT_BINDS: "listenPort:targetPort,..."
 	bindsEnv := os.Getenv("DPIVOT_BINDS")
@@ -313,7 +375,7 @@ func runProxy(log *zap.Logger) error {
 	if controlPort == "" {
 		controlPort = "9900"
 	}
-	controlSrv := api.NewControlServer(reg, srv, log)
+	controlSrv := api.NewControlServer(reg, srv, log, m)
 	go func() {
 		if err := controlSrv.ListenAndServe(":" + controlPort); err != nil {
 			log.Error("control API stopped", zap.Error(err))
@@ -324,14 +386,18 @@ func runProxy(log *zap.Logger) error {
 		zap.String("binds", bindsEnv),
 		zap.String("control_port", controlPort))
 
-	// Wait for signal.
+	// Wait for SIGTERM / SIGINT, then drain in-flight connections gracefully.
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	<-ctx.Done()
 
-	log.Info("proxy: shutting down")
-	srv.Close()
+	log.Info("proxy: SIGTERM received — draining in-flight connections")
+	const drainTimeout = 30 * time.Second
+	if err := srv.CloseGraceful(drainTimeout); err != nil {
+		log.Warn("proxy: drain timeout — forcing close", zap.Error(err))
+		srv.Close()
+	}
 	controlSrv.Close() //nolint:errcheck
 	return nil
 }

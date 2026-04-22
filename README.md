@@ -1,41 +1,58 @@
 # dpivot
 
-> Zero-downtime deployments for Docker Compose — no external proxy required.
+> Zero-downtime deployments for Docker Compose — no Kubernetes, no Traefik, no external proxy.
 
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](go.mod)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-71%20passing-brightgreen)]()
 [![Race Detector](https://img.shields.io/badge/race--clean-✓-brightgreen)]()
 
-`dpivot` is a single Go binary that you drop next to your existing `docker-compose.yml`. It reads the file, injects its own built-in TCP proxy, and writes a new `dpivot-compose.yml`. No Traefik. No nginx. No Kubernetes. Just run the enhanced stack and your host port never goes dark again — even during deployments.
+`dpivot` is a single Go binary you drop next to your existing `docker-compose.yml`. It injects its own built-in TCP proxy, writes a new `dpivot-compose.yml`, and from that point your host port **never goes dark again** — not during deployments, not during container restarts.
+
+No sidecar. No service mesh. No changes to your app.
 
 ---
 
 ## The problem it solves
 
-When you `docker compose up --force-recreate web`, Docker stops the old container, then starts the new one. That gap — usually under a second — is enough to drop HTTP connections, fail health checks in load balancers, and interrupt WebSocket sessions. The standard fix is to add Traefik or nginx as a reverse proxy, configure labels, and hope you got the sticky sessions right.
+When you run `docker compose up --force-recreate web`, Docker stops the old container and then starts the new one. That gap — usually under a second — is enough to drop HTTP connections, fail health checks in load balancers, and kill WebSocket sessions.
 
-dpivot takes a different approach: it owns the host port from the first `docker compose up` and **never releases it**. Container replacement is invisible to the network because the proxy is still there, still accepting connections, routing around whatever is happening underneath.
+The standard fix is to add Traefik or nginx as a reverse proxy. That means learning new config formats, dealing with labels, and adding more moving parts to your stack.
+
+dpivot takes a different approach. It puts a tiny proxy in front of your service that **owns the host port permanently**. Your service becomes a backend behind that proxy. When you deploy a new version, the proxy routes traffic to the new container while the old one drains — and your clients never notice.
 
 ---
 
-## Quick start
+## Quick start (5 minutes)
 
 ```bash
-# Install
-go install github.com/dpivot/dpivot/cmd/dpivot@latest
+# 1. Build the dpivot binary
+git clone https://github.com/dpivot/dpivot.git
+cd dpivot
+make build
+# binary is now at ./bin/dpivot
 
-# Point at your existing docker-compose.yml
-dpivot generate
-
-# Start the enhanced stack
+# 2. Try the included test app
+cd examples/testapp
+cp .env.example .env
+docker compose build
+../../bin/dpivot generate
 docker compose -f dpivot-compose.yml up -d
 
-# Deploy a new version of a service
-dpivot rollout web
+# 3. Open the UI at http://localhost:3000
+# You'll see a live version monitor bar
+
+# 4. Simulate a rollout — bump the API version and deploy
+API_VERSION=2.0.0 docker compose build api
+API_VERSION=2.0.0 ../../bin/dpivot rollout api \
+  --file dpivot-compose.yml \
+  --control-addr http://localhost:9901
+
+# Watch the "api version" badge in the browser flip from 1.0.0 → 2.0.0
+# Zero connections dropped.
 ```
 
-That's the whole workflow.
+That's the whole workflow. For a full walkthrough, see [docs/getting-started.md](docs/getting-started.md).
 
 ---
 
@@ -43,10 +60,10 @@ That's the whole workflow.
 
 ![dpivot architecture](docs/architecture.svg)
 
-Take any standard compose file:
+You give dpivot your original compose file:
 
 ```yaml
-# docker-compose.yml — unchanged, original file
+# docker-compose.yml — your existing file, unchanged
 services:
   web:
     image: myapp:1.0
@@ -58,12 +75,12 @@ services:
       POSTGRES_PASSWORD: secret
 ```
 
-Run `dpivot generate`. It reads each service and applies four rules in order:
+Run `dpivot generate`. It reads each service and applies four rules in priority order:
 
-1. `x-dpivot: skip: true` → pass through unchanged
-2. No `ports` → pass through (workers, sidecars, etc.)
-3. Recognised database image → pass through with a warning
-4. Everything else with ports → inject proxy
+1. Has `x-dpivot: skip: true` → pass through unchanged
+2. No `ports` declared → pass through (workers, sidecars, etc.)
+3. Image is a known database → pass through with a warning
+4. Has `ports`, not a database → inject proxy
 
 ```
 Parsed 2 service(s) — 1 eligible for proxy injection
@@ -75,46 +92,49 @@ dpivot Transform Summary:
 Generated: dpivot-compose.yml
 ```
 
-The generated file rewires things so the proxy owns the host port and `web` is only reachable on the internal `dpivot_mesh` bridge network:
+The generated file rewires things so the proxy permanently owns the host port:
 
 ```
-Client :3000 → dpivot-proxy-web (permanent host port) → web:3000 (replaceable)
+Client :3000 → dpivot-proxy-web (permanent) → web:3000 (replaceable)
 ```
 
-When you `dpivot rollout web`:
+When you run `dpivot rollout web`, it:
 
-1. A second `web` container starts
-2. dpivot waits for its healthcheck to pass
-3. The new container is registered with the proxy via `POST /backends`
-4. The old container is marked draining — no new connections
-5. After a short drain window, the old container is deregistered and stopped
+1. Starts a second `web` container
+2. Waits for its healthcheck to pass
+3. Registers the new container with the proxy (`POST /backends`)
+4. Marks the old container as draining — no new connections
+5. Waits for in-flight requests to finish
+6. Stops and removes the old container
 
-Your clients see nothing. The port never dropped.
+Your clients see nothing. The proxy never dropped the port.
 
 ---
 
 ## Installation
 
-**From source (recommended until a release is tagged):**
+**Build from source:**
 
 ```bash
 git clone https://github.com/dpivot/dpivot.git
 cd dpivot
 make build
-# binary is at ./bin/dpivot
+# binary at ./bin/dpivot — add to your PATH or call directly
 ```
 
-**As a Docker CLI plugin:**
+**As a Docker CLI plugin (run as `docker dpivot ...`):**
 
 ```bash
-make install-plugin
-# now works as: docker dpivot rollout web
+sudo make install-plugin
+# installs to /usr/local/lib/docker/cli-plugins/docker-dpivot
 ```
 
-**Verify:**
+**Verify it works:**
 
 ```bash
 dpivot version
+# dpivot 0.1.0
+
 dpivot --help
 ```
 
@@ -124,14 +144,12 @@ dpivot --help
 
 ### `dpivot generate`
 
-Reads `docker-compose.yml` and writes `dpivot-compose.yml`. The original file is never modified.
+Reads your `docker-compose.yml` and writes `dpivot-compose.yml`. Your original file is never touched.
 
 ```bash
 dpivot generate
 dpivot generate --file docker-compose.prod.yml --output dpivot-compose.prod.yml
 ```
-
-**Options:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -142,39 +160,43 @@ dpivot generate --file docker-compose.prod.yml --output dpivot-compose.prod.yml
 
 ### `dpivot rollout <service>`
 
-Zero-downtime rolling update for a named service.
+Zero-downtime deploy for a named service. Build your new image first, then run this.
 
 ```bash
-dpivot rollout web
+dpivot rollout web --file dpivot-compose.yml --control-addr http://localhost:9901
 dpivot rollout web --pull --timeout 120s --drain 10s
 ```
-
-**Options:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--file`, `-f` | `dpivot-compose.yml` | dpivot compose file |
-| `--pull` | `false` | Pull latest image before starting |
-| `--timeout`, `-t` | `60s` | Healthcheck wait timeout |
-| `--drain`, `-d` | `5s` | Drain window before removing old container |
 | `--control-addr` | `http://localhost:9900` | Proxy control API address |
-| `--api-token` | `$DPIVOT_API_TOKEN` | Bearer token for the control API |
+| `--pull` | `false` | Pull latest image before starting |
+| `--timeout`, `-t` | `60s` | How long to wait for the new container's healthcheck |
+| `--drain`, `-d` | `5s` | How long to let in-flight requests finish on the old container |
+| `--api-token` | `$DPIVOT_API_TOKEN` | Bearer token if you secured the control API |
 
-If the service isn't found in the compose file, you get a clear message:
+> **Finding the right `--control-addr`:** By default, dpivot maps each proxy's control port to the host at `service_host_port + 6900`. So if your service runs on port `3001`, the control API is at `http://localhost:9901`. If it runs on port `3000`, it's at `http://localhost:9900`.
 
+---
+
+### `dpivot rollback <service>`
+
+If something went wrong after a rollout, this restores traffic to the previous version without redeploying.
+
+```bash
+dpivot rollback api --control-addr http://localhost:9901
 ```
-Error: service "web" not found in dpivot-compose.yml
-(did you run dpivot generate first?)
-```
+
+Rollback reads the state file dpivot saved during the last rollout (`/tmp/dpivot-<service>-state.json`). If that file is gone, rollback can't run — deploy the previous image manually instead.
 
 ---
 
 ### `dpivot status`
 
-Queries the proxy control API and shows the current backend state.
+Shows the current backends registered with the proxy.
 
 ```bash
-dpivot status
 dpivot status --control-addr http://localhost:9901
 ```
 
@@ -189,43 +211,24 @@ dpivot version
 
 ---
 
-## Docker CLI plugin
+## Using as a Docker CLI plugin
 
-After `make install-plugin`, dpivot works as a native Docker CLI plugin:
+After `sudo make install-plugin`, every dpivot command works through the Docker CLI:
 
 ```bash
 docker dpivot generate
-docker dpivot rollout web
+docker dpivot rollout web --control-addr http://localhost:9901
 docker dpivot status
 docker dpivot --help
 ```
 
-The plugin binary is the same as the standalone `dpivot` binary. Mode is detected automatically from `argv[0]`.
+The plugin binary is identical to the standalone `dpivot` binary — mode is auto-detected from `argv[0]`.
 
 ---
 
-## Auto-detection rules
+## Opting a service out
 
-dpivot applies these rules per service, stopping at the first match:
-
-| Condition | What happens |
-|-----------|-------------|
-| `x-dpivot: skip: true` | Passed through exactly as-is |
-| No `ports` declared | Passed through (sidecar, worker, etc.) |
-| Image matches database list | Passed through with a log warning |
-| Everything else with ports | Proxy injected |
-
-**Database images that are never proxied by default:**
-
-`postgres`, `postgresql`, `mysql`, `mariadb`, `redis`, `mongo`, `mongodb`,
-`elasticsearch`, `opensearch`, `cassandra`, `couchdb`, `influxdb`, `rabbitmq`,
-`kafka`, `zookeeper`, `mssql`, `clickhouse`, `minio`, `vault`
-
-Matching strips registry prefixes and tags — `docker.io/library/postgres:16` and `bitnami/postgres:latest` both match.
-
----
-
-## Opting out of a specific service
+Add `x-dpivot: skip: true` to keep a service exactly as-is. No proxy will be injected.
 
 ```yaml
 services:
@@ -234,10 +237,10 @@ services:
     ports:
       - "9000:9000"
     x-dpivot:
-      skip: true    # keep port on the service, no proxy injected
+      skip: true
 ```
 
-The `x-dpivot` block is stripped from the generated file. Docker never sees it.
+The `x-dpivot` block is stripped from the generated file so Docker never sees it.
 
 ---
 
@@ -254,40 +257,53 @@ services:
       - "443:443"
 ```
 
-After `dpivot generate`:
-
-```
-dpivot-proxy-frontend owns :80 and :443
-frontend expose-only on dpivot_mesh: 80, 443
-DPIVOT_BINDS = "80:80,443:443"
-```
+The proxy gets both `80:80` and `443:443`. Both stay live during rollouts.
 
 ---
 
-## HTTP control API
+## Databases are always excluded
 
-The proxy runs an HTTP control API on port `9900` (internal only — on `dpivot_mesh`, not exposed to the Docker host by default).
+dpivot never proxies these images — they're stateful and a TCP proxy in front of them causes more problems than it solves:
+
+`postgres`, `mysql`, `mariadb`, `redis`, `mongo`, `elasticsearch`, `opensearch`,
+`cassandra`, `couchdb`, `influxdb`, `rabbitmq`, `kafka`, `zookeeper`,
+`mssql`, `clickhouse`, `minio`, `vault`
+
+Matching strips registry prefixes and tags — `docker.io/library/postgres:16` and `bitnami/postgres:latest` both match. If dpivot auto-detects your service as a database but you want to proxy it anyway, use `x-dpivot: skip: false` is not enough — the detector takes priority. You'd need to contribute a flag to override it.
+
+---
+
+## The proxy control API
+
+Each `dpivot-proxy-<service>` container runs a small HTTP API for backend management. This is what `dpivot rollout` calls internally, but you can use it directly from scripts.
+
+The control port is mapped to your Docker host at `service_host_port + 6900`:
+- Service at `:3000` → control API at `http://localhost:9900`
+- Service at `:3001` → control API at `http://localhost:9901`
+- Service at `:8080` → control API at `http://localhost:14980`
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Liveness check, returns backend count |
-| `GET` | `/backends` | List all registered backends with request counts |
-| `POST` | `/backends` | Register a new backend `{"id":"...","addr":"host:port"}` |
-| `PUT` | `/backends/{id}/drain` | Mark backend as draining (no new connections) |
-| `DELETE` | `/backends/{id}` | Drain then deregister backend |
+| `GET` | `/health` | Liveness check |
+| `GET` | `/backends` | List all backends with request counts |
+| `POST` | `/backends` | Register a new backend |
+| `PUT` | `/backends/{id}/drain` | Stop sending new connections to a backend |
+| `DELETE` | `/backends/{id}` | Remove a backend |
 
-**Optional authentication:** Set `DPIVOT_API_TOKEN` on the proxy container. Requests must include `Authorization: Bearer <token>`. Without the env var, the API works but logs a warning at startup.
+Full reference: [docs/control-api.md](docs/control-api.md)
 
 ---
 
 ## Examples
 
-| Example | What it shows |
-|---------|--------------|
-| [`examples/basic/`](examples/basic/) | Minimal single-service app |
-| [`examples/advanced/`](examples/advanced/) | x-dpivot skip, multi-service stack |
+| Example | What it demonstrates |
+|---------|---------------------|
+| [`examples/testapp/`](examples/testapp/) | Full working app with live rollout monitor in the browser |
+| [`examples/basic/`](examples/basic/) | Minimal single-service setup |
+| [`examples/advanced/`](examples/advanced/) | Multi-service stack with `x-dpivot: skip` |
 | [`examples/multi-port/`](examples/multi-port/) | Multiple host ports on one service |
-| [`examples/generated/`](examples/generated/) | Annotated generated file output |
+| [`examples/production/`](examples/production/) | Nginx + TLS + Prometheus in front of dpivot |
+| [`examples/scripts/`](examples/scripts/) | Safe rollout script with auto-rollback on error |
 
 ---
 
@@ -295,48 +311,49 @@ The proxy runs an HTTP control API on port `9900` (internal only — on `dpivot_
 
 | Doc | Description |
 |-----|-------------|
-| [docs/how-it-works.md](docs/how-it-works.md) | Step-by-step deployment lifecycle |
-| [docs/control-api.md](docs/control-api.md) | Full HTTP control API reference |
-| [docs/configuration.md](docs/configuration.md) | All environment variables and flags |
+| [docs/getting-started.md](docs/getting-started.md) | Step-by-step guide from zero to first rollout |
+| [docs/how-it-works.md](docs/how-it-works.md) | What happens internally during generate and rollout |
+| [docs/control-api.md](docs/control-api.md) | HTTP control API reference |
+| [docs/configuration.md](docs/configuration.md) | All flags and environment variables |
 
 ---
 
-## Comparison
+## Comparison with alternatives
 
 |  | docker-rollout | Dokku | **dpivot** |
 |--|---------------|-------|-----------|
 | Works with existing `docker-compose.yml` | ✅ | ❌ | ✅ |
-| No external proxy needed | ❌ Requires Traefik | ❌ Built-in nginx | ✅ Built-in |
+| No external proxy required | ❌ needs Traefik | ❌ built-in nginx | ✅ built-in |
 | Host port stays live during rollout | ❌ | ✅ | ✅ |
 | HTTP backend management API | ❌ | ❌ | ✅ |
 | Database auto-exclusion | ❌ | ❌ | ✅ |
-| No server/root required | ✅ | ❌ | ✅ |
+| No root/server required | ✅ | ❌ | ✅ |
 | Docker CLI plugin | ❌ | ❌ | ✅ |
 
-docker-rollout requires Traefik or nginx-proxy already running — that's their own documented caveat. dpivot includes the proxy, so you don't need to bring your own.
+docker-rollout documents that it requires Traefik or nginx-proxy already running. dpivot includes the proxy, so you don't need to bring your own.
 
 ---
 
-## Technical details
+## Building
+
+```bash
+make build              # ./bin/dpivot
+make test               # go test -race ./...
+make docker-build       # technicaltalk/dpivot-proxy:latest
+make install-plugin     # /usr/local/lib/docker/cli-plugins/docker-dpivot
+make lint               # golangci-lint run
+```
+
+---
+
+## Technical notes
 
 - **TCP proxy:** pure `net` package, no CGO, no system dependencies
 - **Round-robin:** lock-free `atomic.Uint64` counter, deterministic backend ordering
 - **Registry:** `sync.RWMutex` + heap-allocated `*atomic.Uint64` per backend (race-safe struct copies)
 - **Port ownership:** listener opened once at `docker compose up`, never closed during rollouts
 - **Half-close:** bidirectional `io.Copy` with `CloseWrite()` for correct TCP teardown
-- **Tests:** 71 unit tests, race detector clean across 10 consecutive runs
-
----
-
-## Building from source
-
-```bash
-make build              # ./bin/dpivot
-make test               # go test -race ./...
-make docker-build       # dpivot/proxy:latest
-make install-plugin     # ~/.docker/cli-plugins/docker-dpivot
-make lint               # golangci-lint run
-```
+- **Tests:** 71 unit tests, race detector clean
 
 ---
 

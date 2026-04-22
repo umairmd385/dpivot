@@ -1,0 +1,124 @@
+version: "3.9"
+
+# dpivot testapp — microservice stack for testing zero-downtime deployments.
+#
+# Services:
+#   frontend  (port 3000) — HTML UI, calls the API
+#   api       (port 3001) — REST API, uses Postgres + Redis
+#   db        (postgres)  — stateful, auto-excluded by dpivot
+#   redis     (cache)     — stateful, auto-excluded by dpivot
+#
+# Ports are numeric so dpivot generate can parse them.
+# All other config (versions, passwords, Redis password) comes from .env.
+#
+# Quick start:
+#   cp .env.example .env
+#   docker compose build
+#   dpivot generate --file examples/testapp/docker-compose.yml \
+#                   --output examples/testapp/dpivot-compose.yml
+#   docker compose -f examples/testapp/dpivot-compose.yml up -d
+#
+# Test a rollout (bump APP_VERSION and rebuild):
+#   docker compose -f examples/testapp/docker-compose.yml build api
+#   APP_VERSION=2.0.0 docker compose -f examples/testapp/docker-compose.yml build api
+#   dpivot rollout api --file examples/testapp/dpivot-compose.yml \
+#                      --control-addr http://localhost:9901
+
+services:
+
+  # ── Frontend ─────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: dpivot-testapp-frontend:${FRONTEND_VERSION:-1.0.0}
+    ports:
+      - "3000:3000"
+    environment:
+      PORT:        "3000"
+      APP_VERSION: "${FRONTEND_VERSION:-1.0.0}"
+      API_URL:     "http://api:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health/live || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Backend API ───────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: dpivot-testapp-api:${API_VERSION:-1.0.0}
+    ports:
+      - "3001:3001"
+    environment:
+      PORT:           "3001"
+      APP_VERSION:    "${API_VERSION:-1.0.0}"
+      DATABASE_URL:   "postgres://app:${DB_PASSWORD:-secret}@db:5432/appdb"
+      REDIS_HOST:     "redis"
+      REDIS_PORT:     "6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+    healthcheck:
+      # /health/ready checks DB + Redis — dpivot rollout waits for this.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  # Stateful: dpivot auto-excludes postgres images. Also marked x-dpivot: skip.
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     app
+      POSTGRES_PASSWORD: "${DB_PASSWORD:-secret}"
+      POSTGRES_DB:       appdb
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    x-dpivot:
+      skip: true
+
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  # Stateful: dpivot auto-excludes redis images. Also marked x-dpivot: skip.
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --loglevel warning
+      --save 60 1
+      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    x-dpivot:
+      skip: true
+
+volumes:
+  db_data:
+  redis_data:

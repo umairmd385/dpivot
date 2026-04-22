@@ -1,0 +1,53 @@
+# Prometheus scrape configuration for a dpivot stack.
+#
+# Scrapes:
+#   - dpivot-proxy-api:9900/metrics  → proxy-level counters (connections, active, errors)
+#   - api:3000/metrics               → application metrics (if app exposes Prometheus)
+#
+# Key metrics to alert on:
+#   dpivot_connections_failed_total  — rising: backend unreachable during rollout
+#   dpivot_connections_active        — spike: traffic surge or connection leak
+#   dpivot_backends_active           — 0: no live backends, full outage
+#   dpivot_uptime_seconds            — reset: proxy restarted unexpectedly
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+  external_labels:
+    environment: production
+    stack: dpivot
+
+rule_files:
+  - "/etc/prometheus/alerts/*.yml"
+
+scrape_configs:
+
+  # ── dpivot proxy metrics ────────────────────────────────────────────────────
+  # The /metrics endpoint is on the control API port (9900), not the app port.
+  # It is reachable from Prometheus only if both are on dpivot_mesh.
+  - job_name: "dpivot-proxy"
+    static_configs:
+      - targets: ["dpivot-proxy-api:9900"]
+        labels:
+          service: "api"
+          role: "proxy"
+    metrics_path: /metrics
+    scrape_interval: 10s   # poll more frequently during rollouts
+
+  # ── Application metrics ─────────────────────────────────────────────────────
+  # Assumes the app exposes Prometheus at /metrics on its container port.
+  # Remove or adjust if your app uses a different path or port.
+  - job_name: "api"
+    static_configs:
+      - targets: ["api:3000"]
+        labels:
+          service: "api"
+          role: "app"
+    metrics_path: /metrics
+    scrape_interval: 15s
+
+  # ── Prometheus self-monitoring ───────────────────────────────────────────────
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

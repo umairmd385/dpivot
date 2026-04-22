@@ -1,0 +1,15 @@
+{
+  "name": "dpivot-testapp-frontend",
+  "version": "1.0.0",
+  "description": "dpivot test frontend — Express + HTML UI calling the backend API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

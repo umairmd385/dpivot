@@ -1,0 +1,44 @@
+# Compiled binary
+bin/
+
+# Go test and coverage artifacts
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Environment files — never commit real secrets
+.env
+.env.local
+examples/**/.env
+
+# Generated compose files — created by `dpivot generate`, not source
+examples/testapp/dpivot-compose.yml
+examples/advanced/dpivot-compose.yml
+
+# dpivot runtime state (rollout lock + state files written to /tmp)
+*.lock
+dpivot-*-state.json
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Claude Code settings (local only)
+.claude/
+
+# Dependency cache (shouldn't be here but just in case)
+vendor/

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -56,21 +57,94 @@ func (o *Options) defaults() {
 	}
 }
 
+// ── Rollout state (for rollback) ──────────────────────────────────────────────
+
+// RolloutState is written to /tmp between steps 5 and 7 of a rollout (after
+// the new backend is registered, before the old one is removed). It enables
+// the rollback command to restore traffic to the previous version if the new
+// deployment is unhealthy.
+type RolloutState struct {
+	Service      string        `json:"service"`
+	OldBackendID string        `json:"old_backend_id"`
+	OldAddr      string        `json:"old_addr"`
+	NewBackendID string        `json:"new_backend_id"`
+	NewAddr      string        `json:"new_addr"`
+	ControlAddr  string        `json:"control_addr"`
+	APIToken     string        `json:"api_token,omitempty"`
+	Drain        time.Duration `json:"drain_ns"`
+	StartedAt    time.Time     `json:"started_at"`
+}
+
+func statePath(service string) string {
+	return fmt.Sprintf("/tmp/dpivot-%s-state.json", service)
+}
+
+func saveState(s RolloutState) error {
+	data, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(statePath(s.Service), data, 0600)
+}
+
+// LoadState reads the last rollout state for the given service so Rollback can
+// consume it. Returns an error if no state file exists.
+func LoadState(service string) (RolloutState, error) {
+	data, err := os.ReadFile(statePath(service))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return RolloutState{}, fmt.Errorf("no rollout state for %q — run a rollout first", service)
+		}
+		return RolloutState{}, err
+	}
+	var s RolloutState
+	return s, json.Unmarshal(data, &s)
+}
+
+func clearState(service string) {
+	os.Remove(statePath(service)) //nolint:errcheck
+}
+
+// ── Mutual exclusion ──────────────────────────────────────────────────────────
+
+// lockRollout prevents concurrent rollouts for the same service by creating an
+// exclusive lock file. Returns an unlock function on success.
+func lockRollout(service string) (func(), error) {
+	lockPath := fmt.Sprintf("/tmp/dpivot-rollout-%s.lock", service)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("rollout already in progress for %q (lock: %s) — wait or remove if stale", service, lockPath)
+		}
+		return nil, fmt.Errorf("rollout: acquire lock: %w", err)
+	}
+	f.Close()
+	return func() { os.Remove(lockPath) }, nil //nolint:errcheck
+}
+
+// ── Run ───────────────────────────────────────────────────────────────────────
+
 // Run executes a zero-downtime rolling update for the given service.
 //
 // Steps:
-//  1. Optionally pull the new image.
-//  2. Scale the service to +1 instance (docker compose up --scale).
-//  3. Wait for the new container's healthcheck to pass (or timeout).
-//  4. Determine the new container's IP on dpivot_mesh.
+//  1. Acquire exclusive lock (prevents concurrent rollouts for this service).
+//  2. Optionally pull the new image.
+//  3. Scale the service to +1 instance (docker compose up --scale).
+//  4. Wait for the new container's healthcheck to pass (or timeout).
 //  5. Register the new container with the proxy via POST /backends.
-//  6. Wait for the drain period so in-flight requests complete.
-//  7. Deregister the old container via DELETE /backends/{id}.
-//  8. Scale back to the original count (remove old container).
+//  6. Persist rollout state to /tmp (enables rollback).
+//  7. Drain old container; wait drain period so in-flight requests complete.
+//  8. Deregister the old container via DELETE /backends/{id}.
+//  9. Scale back to the original count (remove old container).
+//  10. Clear rollout state.
 func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 	opts.defaults()
 
-	proxyName := "dpivot-proxy-" + opts.Service
+	unlock, err := lockRollout(opts.Service)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	log.Info("rollout: starting",
 		zap.String("service", opts.Service),
@@ -94,7 +168,7 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 	// ── Step 3: Wait for healthcheck ──────────────────────────────────────
 	newID, newAddr, err := waitForNewContainer(ctx, opts, log)
 	if err != nil {
-		// Cleanup: scale back down.
+		// Cleanup: scale back down on healthcheck timeout.
 		_ = composeRun(ctx, opts.ComposeFile, "up", "-d", "--no-deps",
 			"--scale", opts.Service+"=1", opts.Service)
 		return fmt.Errorf("rollout: wait for healthy container: %w", err)
@@ -120,23 +194,40 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 		zap.String("backend_id", newBackendID),
 		zap.String("addr", newAddr))
 
-	// ── Step 6: Drain period ──────────────────────────────────────────────
-	log.Info("rollout: draining old connections",
-		zap.Duration("drain", opts.Drain))
-
+	// ── Step 6: Persist rollout state (enables rollback) ─────────────────
+	oldBackendID := ""
+	oldAddr := ""
 	if oldID != "" {
-		_ = drainBackend(ctx, opts, opts.Service+"-"+oldID[:12], log)
+		oldBackendID = opts.Service + "-" + oldID[:12]
+		if addr, err := containerAddr(ctx, oldID); err == nil {
+			oldAddr = addr
+		}
 	}
+	_ = saveState(RolloutState{
+		Service:      opts.Service,
+		OldBackendID: oldBackendID,
+		OldAddr:      oldAddr,
+		NewBackendID: newBackendID,
+		NewAddr:      newAddr,
+		ControlAddr:  opts.ControlAddr,
+		APIToken:     opts.APIToken,
+		Drain:        opts.Drain,
+		StartedAt:    time.Now(),
+	})
 
+	// ── Step 7: Drain old connections ─────────────────────────────────────
+	log.Info("rollout: draining old connections", zap.Duration("drain", opts.Drain))
+	if oldID != "" {
+		_ = drainBackend(ctx, opts, oldBackendID, log)
+	}
 	select {
 	case <-time.After(opts.Drain):
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 
-	// ── Step 7: Deregister old backend ────────────────────────────────────
+	// ── Step 8: Deregister old backend ────────────────────────────────────
 	if oldID != "" {
-		oldBackendID := opts.Service + "-" + oldID[:12]
 		if err := deregisterBackend(ctx, opts, oldBackendID, log); err != nil {
 			log.Warn("rollout: could not deregister old backend",
 				zap.String("id", oldBackendID),
@@ -144,16 +235,83 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 		}
 	}
 
-	// ── Step 8: Scale back to 1 ───────────────────────────────────────────
-	log.Info("rollout: scaling back to 1", zap.String("service", opts.Service))
-	if err := composeRun(ctx, opts.ComposeFile, "up", "-d", "--no-deps",
-		"--scale", opts.Service+"=1", opts.Service); err != nil {
-		return fmt.Errorf("rollout: scale down: %w", err)
+	// ── Step 9: Remove old container (keep new one) ───────────────────────
+	// We stop and remove the OLD container explicitly instead of using
+	// --scale=1, because compose scale-down removes the newest container
+	// (api-2) and keeps the old one (api-1), which is the opposite of what
+	// we want.
+	if oldID != "" {
+		log.Info("rollout: removing old container", zap.String("id", oldID))
+		_ = exec.CommandContext(ctx, "docker", "stop", oldID).Run()
+		_ = exec.CommandContext(ctx, "docker", "rm", oldID).Run()
 	}
 
-	log.Info("rollout: complete",
-		zap.String("service", opts.Service),
-		zap.String("proxy", proxyName))
+	// ── Step 10: Clear state ──────────────────────────────────────────────
+	clearState(opts.Service)
+
+	log.Info("rollout: complete", zap.String("service", opts.Service))
+	return nil
+}
+
+// ── Rollback ──────────────────────────────────────────────────────────────────
+
+// Rollback restores traffic to the previous backend recorded in the rollout
+// state file, and drains/removes the new (failing) backend.
+//
+// Call this when a just-deployed service is unhealthy and you need to restore
+// the previous version without a full re-deploy. The rollout state is cleared
+// after a successful rollback.
+func Rollback(ctx context.Context, state RolloutState, log *zap.Logger) error {
+	if state.OldBackendID == "" || state.OldAddr == "" {
+		return fmt.Errorf("rollback: no old backend recorded in state — cannot roll back")
+	}
+
+	log.Info("rollback: starting",
+		zap.String("service", state.Service),
+		zap.String("restoring", state.OldBackendID),
+		zap.String("draining", state.NewBackendID))
+
+	opts := Options{
+		ControlAddr: state.ControlAddr,
+		APIToken:    state.APIToken,
+		Drain:       state.Drain,
+	}
+	if opts.Drain == 0 {
+		opts.Drain = 5 * time.Second
+	}
+
+	// Re-register old backend (it may have been removed; 409 if still present is ok).
+	if err := registerBackend(ctx, opts, state.OldBackendID, state.OldAddr, log); err != nil {
+		if !strings.Contains(err.Error(), "409") {
+			return fmt.Errorf("rollback: restore old backend: %w", err)
+		}
+		log.Info("rollback: old backend already registered", zap.String("id", state.OldBackendID))
+	} else {
+		log.Info("rollback: old backend restored", zap.String("id", state.OldBackendID))
+	}
+
+	// Drain the new (failing) backend.
+	if state.NewBackendID != "" {
+		_ = drainBackend(ctx, opts, state.NewBackendID, log)
+		log.Info("rollback: draining new backend",
+			zap.String("id", state.NewBackendID),
+			zap.Duration("drain", opts.Drain))
+
+		select {
+		case <-time.After(opts.Drain):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		if err := deregisterBackend(ctx, opts, state.NewBackendID, log); err != nil {
+			log.Warn("rollback: could not remove new backend (may not exist)",
+				zap.String("id", state.NewBackendID),
+				zap.Error(err))
+		}
+	}
+
+	clearState(state.Service)
+	log.Info("rollback: complete", zap.String("service", state.Service))
 	return nil
 }
 
@@ -197,6 +355,7 @@ func waitForNewContainer(ctx context.Context, opts Options, log *zap.Logger) (id
 
 // inspectNewestHealthy finds the most recently started container for the
 // service that is either healthy (has healthcheck) or running (no healthcheck).
+// Returns id and addr in "ip:port" form ready for the proxy control API.
 func inspectNewestHealthy(ctx context.Context, service string) (id, addr string, err error) {
 	out, err := exec.CommandContext(ctx, "docker", "ps",
 		"--filter", "label=com.docker.compose.service="+service,
@@ -211,11 +370,12 @@ func inspectNewestHealthy(ctx context.Context, service string) (id, addr string,
 		return "", "", fmt.Errorf("service %q: waiting for second container (found %d)", service, len(ids))
 	}
 
-	// Query the newest ID (first in `docker ps` output, sorted newest-first).
 	id = ids[0]
+	// Emit health status, "name=ip" network pairs, and "port/proto" exposed port pairs.
+	// ExposedPorts is map[Port]struct{} so we range with $k,$v to get the key.
 	inspectOut, err := exec.CommandContext(ctx, "docker", "inspect",
 		"--format",
-		`{{.State.Health.Status}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}`,
+		`{{.State.Health.Status}}{{range $n, $v := .NetworkSettings.Networks}} net={{$n}}={{$v.IPAddress}}{{end}}{{range $k, $v := .Config.ExposedPorts}} port={{$k}}{{end}}`,
 		id,
 	).Output()
 	if err != nil {
@@ -231,17 +391,36 @@ func inspectNewestHealthy(ctx context.Context, service string) (id, addr string,
 	if healthStatus == "unhealthy" {
 		return "", "", fmt.Errorf("container %s is unhealthy", id)
 	}
-	// "healthy" | "starting" (has healthcheck) or first field is IP (no healthcheck)
 	if healthStatus == "starting" {
 		return "", "", fmt.Errorf("container %s healthcheck is still starting", id)
 	}
 
-	// IP is the last field.
-	ip := fields[len(fields)-1]
-	if ip == "" {
-		return "", "", fmt.Errorf("container %s has no IP on dpivot_mesh", id)
+	// Parse network and port tokens.
+	var netTokens, portTokens []string
+	for _, f := range fields[1:] {
+		if strings.HasPrefix(f, "net=") {
+			netTokens = append(netTokens, strings.TrimPrefix(f, "net="))
+		} else if strings.HasPrefix(f, "port=") {
+			portTokens = append(portTokens, strings.TrimPrefix(f, "port="))
+		}
 	}
-	return id, ip, nil
+
+	ip := pickMeshIP(netTokens)
+	if ip == "" {
+		return "", "", fmt.Errorf("container %s has no IP address", id)
+	}
+
+	// Extract the first exposed port number (format: "3001/tcp").
+	port := "80"
+	if len(portTokens) > 0 {
+		if p, _, found := strings.Cut(portTokens[0], "/"); found {
+			port = p
+		} else {
+			port = portTokens[0]
+		}
+	}
+
+	return id, ip + ":" + port, nil
 }
 
 // findOldContainer returns the ID of the container that is NOT the newID.
@@ -259,6 +438,63 @@ func findOldContainer(ctx context.Context, service, newID string) (string, error
 		}
 	}
 	return "", fmt.Errorf("could not find old container for service %q", service)
+}
+
+// containerAddr returns the dpivot_mesh "ip:port" of the given container.
+func containerAddr(ctx context.Context, id string) (string, error) {
+	out, err := exec.CommandContext(ctx, "docker", "inspect",
+		"--format",
+		`{{range $n, $v := .NetworkSettings.Networks}}net={{$n}}={{$v.IPAddress}} {{end}}{{range $k, $v := .Config.ExposedPorts}}port={{$k}} {{end}}`,
+		id,
+	).Output()
+	if err != nil {
+		return "", err
+	}
+	var netTokens, portTokens []string
+	for _, f := range strings.Fields(string(out)) {
+		if strings.HasPrefix(f, "net=") {
+			netTokens = append(netTokens, strings.TrimPrefix(f, "net="))
+		} else if strings.HasPrefix(f, "port=") {
+			portTokens = append(portTokens, strings.TrimPrefix(f, "port="))
+		}
+	}
+	ip := pickMeshIP(netTokens)
+	if ip == "" {
+		return "", fmt.Errorf("container %s has no IP", id)
+	}
+	port := "80"
+	if len(portTokens) > 0 {
+		if p, _, found := strings.Cut(portTokens[0], "/"); found {
+			port = p
+		} else {
+			port = portTokens[0]
+		}
+	}
+	return ip + ":" + port, nil
+}
+
+// pickMeshIP selects the IP from the dpivot_mesh network out of a slice of
+// "networkname=ip" tokens. Falls back to the first parseable IP if no mesh
+// network is found.
+func pickMeshIP(tokens []string) string {
+	fallback := ""
+	for _, token := range tokens {
+		eq := strings.IndexByte(token, '=')
+		if eq < 0 {
+			continue
+		}
+		name, ip := token[:eq], token[eq+1:]
+		if ip == "" {
+			continue
+		}
+		if fallback == "" {
+			fallback = ip
+		}
+		if strings.HasSuffix(name, "dpivot_mesh") {
+			return ip
+		}
+	}
+	return fallback
 }
 
 // ── Control API helpers ───────────────────────────────────────────────────────

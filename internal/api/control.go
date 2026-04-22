@@ -16,35 +16,41 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/dpivot/dpivot/internal/metrics"
 	"github.com/dpivot/dpivot/internal/proxy"
 	"go.uber.org/zap"
 )
 
 // ControlServer exposes the dpivot backend management API over HTTP.
 type ControlServer struct {
-	reg    *proxy.Registry
-	srv    *proxy.Server
-	log    *zap.Logger
-	token  string   // empty → unauthenticated (warning at startup)
-	ln     net.Listener
-	mux    *http.ServeMux
+	reg       *proxy.Registry
+	srv       *proxy.Server
+	log       *zap.Logger
+	metrics   *metrics.Proxy
+	startTime time.Time
+	token     string // empty → unauthenticated (warning at startup)
+	ln        net.Listener
+	mux       *http.ServeMux
 }
 
-// NewControlServer creates a control server backed by reg and srv.
+// NewControlServer creates a control server backed by reg, srv, and m.
 // It reads DPIVOT_API_TOKEN from the environment at construction time.
-func NewControlServer(reg *proxy.Registry, srv *proxy.Server, log *zap.Logger) *ControlServer {
+func NewControlServer(reg *proxy.Registry, srv *proxy.Server, log *zap.Logger, m *metrics.Proxy) *ControlServer {
 	token := os.Getenv("DPIVOT_API_TOKEN")
 	if token == "" {
 		log.Warn("control API is unauthenticated — set DPIVOT_API_TOKEN to secure it")
 	}
 
 	cs := &ControlServer{
-		reg:   reg,
-		srv:   srv,
-		log:   log,
-		token: token,
-		mux:   http.NewServeMux(),
+		reg:       reg,
+		srv:       srv,
+		log:       log,
+		metrics:   m,
+		startTime: time.Now(),
+		token:     token,
+		mux:       http.NewServeMux(),
 	}
 	cs.registerRoutes()
 	return cs
@@ -76,14 +82,24 @@ func (cs *ControlServer) Handler() http.Handler { return cs.mux }
 // ── Route registration ────────────────────────────────────────────────────────
 
 func (cs *ControlServer) registerRoutes() {
+	// Legacy health (kept for backward compat with existing compose healthchecks).
 	cs.mux.HandleFunc("/health", cs.handleHealth)
+
+	// Split health: liveness (is the process up?) and readiness (can it serve traffic?).
+	cs.mux.HandleFunc("/health/live", cs.handleLive)
+	cs.mux.HandleFunc("/health/ready", cs.handleReady)
+
+	// Prometheus text metrics — no auth, safe to scrape from internal network.
+	cs.mux.HandleFunc("/metrics", cs.handleMetrics)
+
+	// Backend management — auth-protected.
 	cs.mux.HandleFunc("/backends", cs.auth(cs.handleBackends))
 	cs.mux.HandleFunc("/backends/", cs.auth(cs.handleBackendByID))
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
+// ── Health handlers ───────────────────────────────────────────────────────────
 
-// GET /health
+// GET /health — legacy endpoint, kept for backward compatibility.
 func (cs *ControlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, r.Method, "GET")
@@ -94,6 +110,70 @@ func (cs *ControlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"backends": cs.reg.Len(),
 	})
 }
+
+// GET /health/live — liveness probe.
+// Always returns 200 while the process is running. Use this for Docker
+// HEALTHCHECK and Kubernetes livenessProbe. A failing liveness probe triggers
+// a container restart.
+func (cs *ControlServer) handleLive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, r.Method, "GET")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":         "ok",
+		"uptime_seconds": time.Since(cs.startTime).Seconds(),
+	})
+}
+
+// GET /health/ready — readiness probe.
+// Returns 200 only when at least one active (non-draining) backend is
+// registered. Returns 503 during startup or drain. Use this for Docker
+// HEALTHCHECK so dpivot waits for a backend before dpivot rollout registers it.
+// Also use as the Kubernetes readinessProbe target.
+func (cs *ControlServer) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, r.Method, "GET")
+		return
+	}
+	active := cs.reg.Active()
+	if len(active) == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status": "not_ready",
+			"reason": "no active backends",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":          "ready",
+		"active_backends": len(active),
+	})
+}
+
+// GET /metrics — Prometheus text format.
+// Exposes proxy-level counters (connections, errors, uptime) plus per-backend
+// request counts. Scrape this from Prometheus or any OpenMetrics collector.
+func (cs *ControlServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, r.Method, "GET")
+		return
+	}
+	all := cs.reg.Backends()
+	active := cs.reg.Active()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	cs.metrics.WritePrometheus(w, len(all), len(active))
+
+	// Per-backend request counts.
+	fmt.Fprint(w, "# HELP dpivot_backend_requests_total Requests routed to each backend\n")
+	fmt.Fprint(w, "# TYPE dpivot_backend_requests_total counter\n")
+	for _, b := range all {
+		fmt.Fprintf(w, "dpivot_backend_requests_total{id=%q,addr=%q,draining=%q} %d\n",
+			b.ID, b.Addr, fmt.Sprintf("%v", b.Draining), b.MarshalledRequests())
+	}
+}
+
+// ── Backend CRUD ──────────────────────────────────────────────────────────────
 
 // GET /backends        → list all
 // POST /backends       → register a new backend
@@ -111,7 +191,6 @@ func (cs *ControlServer) handleBackends(w http.ResponseWriter, r *http.Request) 
 // DELETE /backends/{id}        → drain + deregister
 // PUT    /backends/{id}/drain  → mark draining only
 func (cs *ControlServer) handleBackendByID(w http.ResponseWriter, r *http.Request) {
-	// Path: /backends/<id>  or  /backends/<id>/drain
 	path := strings.TrimPrefix(r.URL.Path, "/backends/")
 	parts := strings.SplitN(path, "/", 2)
 	id := parts[0]
@@ -122,7 +201,6 @@ func (cs *ControlServer) handleBackendByID(w http.ResponseWriter, r *http.Reques
 	}
 
 	if len(parts) == 2 && parts[1] == "drain" {
-		// PUT /backends/{id}/drain
 		if r.Method != http.MethodPut {
 			methodNotAllowed(w, r.Method, "PUT")
 			return
@@ -131,7 +209,6 @@ func (cs *ControlServer) handleBackendByID(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// DELETE /backends/{id}
 	if r.Method != http.MethodDelete {
 		methodNotAllowed(w, r.Method, "DELETE")
 		return
@@ -177,7 +254,6 @@ func (cs *ControlServer) addBackend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "addr is required", "missing_field")
 		return
 	}
-	// Auto-generate ID if omitted.
 	if req.ID == "" {
 		req.ID = req.Addr
 	}
@@ -213,8 +289,7 @@ func (cs *ControlServer) drainBackend(w http.ResponseWriter, id string) {
 }
 
 func (cs *ControlServer) removeBackend(w http.ResponseWriter, id string) {
-	// Drain first (best effort — ignore error if already draining).
-	_ = cs.reg.SetDraining(id)
+	_ = cs.reg.SetDraining(id) // best-effort pre-drain
 
 	if err := cs.reg.Remove(id); err != nil {
 		code := http.StatusNotFound

@@ -103,8 +103,15 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 		backing.Expose = appendUnique(backing.Expose, strconv.Itoa(pp.container))
 	}
 
-	// Join dpivot_mesh.
+	// Join dpivot_mesh. If the service had no explicit networks it was on the
+	// implicit "default" network; preserve that so it can still reach stateful
+	// services (db, redis) that are not on dpivot_mesh.
+	if len(backing.Networks) == 0 {
+		backing.Networks = append(backing.Networks, "default")
+	}
 	backing.Networks = appendUnique(backing.Networks, "dpivot_mesh")
+	// Sync network list to RawFields (Networks has yaml:"-").
+	backing.RawFields["networks"] = toRawSlice(backing.Networks)
 
 	// Inject DPIVOT_BACKEND env var (informational).
 	if backing.Environment == nil {
@@ -113,9 +120,12 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 	if len(pairs) > 0 {
 		backing.Environment["DPIVOT_BACKEND"] = fmt.Sprintf("%s:%d", name, pairs[0].container)
 	}
+	// Sync environment map to RawFields (Environment has yaml:"-").
+	backing.RawFields["environment"] = toRawMap(backing.Environment)
 
 	// Strip x-dpivot so Docker never sees it.
 	backing.XDpivot = XDpivotConfig{}
+	delete(backing.RawFields, "x-dpivot")
 
 	// ── Labels ───────────────────────────────────────────────────────────
 	labels := map[string]interface{}{
@@ -147,23 +157,35 @@ func buildProxyPair(name string, svc Service) (backing Service, proxy Service, e
 	}
 
 	// Ports owned by the proxy (original host port bindings).
-	proxyPorts := make([]string, 0, len(pairs))
+	// Convention: control port on the host = first traffic host port + 6900
+	// e.g. service at host:3001 → control reachable at localhost:9901
+	controlHostPort := 9900
+	if len(pairs) > 0 {
+		controlHostPort = pairs[0].host + 6900
+	}
+	proxyPorts := make([]string, 0, len(pairs)+1)
 	for _, pp := range pairs {
 		proxyPorts = append(proxyPorts, fmt.Sprintf("%d:%d", pp.host, pp.host))
 	}
+	proxyPorts = append(proxyPorts, fmt.Sprintf("%d:9900", controlHostPort))
 
+	proxyEnv := map[string]string{
+		"DPIVOT_BINDS":        strings.Join(binds, ","),
+		"DPIVOT_TARGETS":      initialBackend,
+		"DPIVOT_CONTROL_PORT": "9900",
+	}
 	proxy = Service{
-		Image: "dpivot/proxy:latest",
-		Ports: proxyPorts,
-		Expose: []string{"9900"},
-		Networks: []string{"dpivot_mesh"},
+		Image:     "technicaltalk/dpivot-proxy:latest",
+		Ports:     proxyPorts,
+		Expose:    []string{"9900"},
+		Networks:  []string{"dpivot_mesh"},
 		DependsOn: []string{name},
-		Environment: map[string]string{
-			"DPIVOT_BINDS":        strings.Join(binds, ","),
-			"DPIVOT_TARGETS":      initialBackend,
-			"DPIVOT_CONTROL_PORT": "9900",
-		},
+		Environment: proxyEnv,
 		RawFields: map[string]interface{}{
+			// These three fields have yaml:"-" and must live in RawFields to be emitted.
+			"environment": toRawMap(proxyEnv),
+			"networks":    toRawSlice([]string{"dpivot_mesh"}),
+			"depends_on":  toRawSlice([]string{name}),
 			"labels": map[string]interface{}{
 				"dpivot.proxy":   "true",
 				"dpivot.service": name,
@@ -247,6 +269,26 @@ func copyStrMap(m map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// toRawSlice converts []string to []interface{} for storage in RawFields.
+// Necessary because RawFields values are map[string]interface{} and yaml
+// marshals []interface{} correctly while []string inside interface{} may not.
+func toRawSlice(s []string) []interface{} {
+	out := make([]interface{}, len(s))
+	for i, v := range s {
+		out[i] = v
+	}
+	return out
+}
+
+// toRawMap converts map[string]string to map[string]interface{} for RawFields.
+func toRawMap(m map[string]string) map[string]interface{} {
+	out := make(map[string]interface{}, len(m))
 	for k, v := range m {
 		out[k] = v
 	}

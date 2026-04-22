@@ -107,6 +107,7 @@ func coerceService(name string, raw map[string]interface{}) (Service, error) {
 				return Service{}, fmt.Errorf("environment: %w", err)
 			}
 			svc.Environment = env
+			svc.RawFields[k] = v // preserve original for marshalling (typed field has yaml:"-")
 
 		case "networks":
 			nets, err := coerceStringSlice(v)
@@ -116,15 +117,17 @@ func coerceService(name string, raw map[string]interface{}) (Service, error) {
 				continue
 			}
 			svc.Networks = nets
+			svc.RawFields[k] = v // preserve for marshalling
 
 		case "depends_on":
 			deps, err := coerceStringSlice(v)
 			if err != nil {
-				// depends_on can be map-form (with condition)
+				// depends_on can be map-form (with condition); stays in RawFields only
 				svc.RawFields[k] = v
 				continue
 			}
 			svc.DependsOn = deps
+			svc.RawFields[k] = v // preserve for marshalling
 
 		case "x-dpivot":
 			// Decode x-dpivot block manually.

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dpivot/dpivot/internal/metrics"
 	"go.uber.org/zap"
 )
 
@@ -40,18 +41,21 @@ type portListener struct {
 //
 // All public methods are safe for concurrent use.
 type Server struct {
-	router *Router
-	log    *zap.Logger
+	router  *Router
+	log     *zap.Logger
+	metrics *metrics.Proxy
 
-	mu        sync.RWMutex
-	listeners map[int]*portListener // real listen port → listener
+	mu          sync.RWMutex
+	listeners   map[int]*portListener // real listen port → listener
+	activeConns sync.WaitGroup        // tracks in-flight connections for graceful drain
 }
 
-// NewServer creates a proxy server backed by the given router.
-func NewServer(router *Router, log *zap.Logger) *Server {
+// NewServer creates a proxy server backed by the given router and metrics.
+func NewServer(router *Router, log *zap.Logger, m *metrics.Proxy) *Server {
 	return &Server{
 		router:    router,
 		log:       log,
+		metrics:   m,
 		listeners: make(map[int]*portListener),
 	}
 }
@@ -83,8 +87,7 @@ func (s *Server) Bind(b PortBinding) error {
 	s.listeners[realPort] = pl
 	go s.acceptLoop(pl)
 
-	s.log.Info("proxy: port bound",
-		zap.Int("port", realPort))
+	s.log.Info("proxy: port bound", zap.Int("port", realPort))
 	return nil
 }
 
@@ -105,7 +108,9 @@ func (s *Server) Unbind(listenPort int) error {
 	return nil
 }
 
-// Close shuts down all active listeners.
+// Close shuts down all active listeners immediately.
+// In-flight connections continue until they complete naturally; use
+// CloseGraceful to wait for them on SIGTERM.
 func (s *Server) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -116,6 +121,45 @@ func (s *Server) Close() {
 		delete(s.listeners, port)
 	}
 	s.log.Info("proxy: all ports closed")
+}
+
+// CloseGraceful stops accepting new connections, then waits up to timeout for
+// all in-flight connections to complete. Returns an error on timeout so the
+// caller can decide whether to force-close or log the situation.
+//
+// Typical SIGTERM handler:
+//
+//	if err := srv.CloseGraceful(30 * time.Second); err != nil {
+//	    log.Warn("drain timeout — forcing close", zap.Error(err))
+//	    srv.Close()
+//	}
+func (s *Server) CloseGraceful(timeout time.Duration) error {
+	s.mu.Lock()
+	for port, pl := range s.listeners {
+		close(pl.done)
+		pl.listener.Close()
+		delete(s.listeners, port)
+	}
+	s.mu.Unlock()
+
+	s.log.Info("proxy: listeners closed — waiting for in-flight connections",
+		zap.Duration("timeout", timeout))
+
+	done := make(chan struct{})
+	go func() {
+		s.activeConns.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.log.Info("proxy: all connections drained")
+		return nil
+	case <-time.After(timeout):
+		s.log.Warn("proxy: graceful drain timed out — connections may be interrupted",
+			zap.Duration("timeout", timeout))
+		return fmt.Errorf("proxy: drain timeout (%s)", timeout)
+	}
 }
 
 // Bindings returns a snapshot of currently active PortBindings.
@@ -148,15 +192,23 @@ func (s *Server) acceptLoop(pl *portListener) {
 				continue
 			}
 		}
+		// Add(1) before the goroutine so CloseGraceful's Wait() always sees it.
+		s.activeConns.Add(1)
 		go s.handleConn(conn)
 	}
 }
 
 func (s *Server) handleConn(client net.Conn) {
-	defer client.Close()
+	s.metrics.ConnStart()
+	defer func() {
+		s.metrics.ConnEnd()
+		s.activeConns.Done()
+		client.Close()
+	}()
 
 	backend, err := s.router.Next()
 	if err != nil {
+		s.metrics.ConnFailed()
 		s.log.Warn("proxy: no backend — dropping connection",
 			zap.String("client", client.RemoteAddr().String()),
 			zap.Error(err))
@@ -165,6 +217,7 @@ func (s *Server) handleConn(client net.Conn) {
 
 	upstream, err := dialer.Dial("tcp", backend.Addr)
 	if err != nil {
+		s.metrics.ConnFailed()
 		s.log.Warn("proxy: dial backend failed",
 			zap.String("addr", backend.Addr),
 			zap.Error(err))
