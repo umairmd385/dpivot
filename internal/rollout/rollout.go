@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +75,36 @@ type RolloutState struct {
 	APIToken     string        `json:"api_token,omitempty"`
 	Drain        time.Duration `json:"drain_ns"`
 	StartedAt    time.Time     `json:"started_at"`
+}
+
+// Runtime abstracts container runtime operations used by rollout orchestration.
+type Runtime interface {
+	Pull(ctx context.Context, composeFile, service string) error
+	ServiceReplicaCount(ctx context.Context, service string) (int, error)
+	ScaleService(ctx context.Context, composeFile, service string, replicas int) error
+	WaitForNewContainer(ctx context.Context, opts Options, log *zap.Logger) (id, addr string, err error)
+	FindOldContainer(ctx context.Context, service, newID string) (string, error)
+	ContainerAddr(ctx context.Context, id string) (string, error)
+	RemoveContainer(ctx context.Context, id string) error
+}
+
+// ControlAPI abstracts rollout calls to the proxy control plane.
+type ControlAPI interface {
+	RegisterBackend(ctx context.Context, opts Options, id, addr string, log *zap.Logger) error
+	DrainBackend(ctx context.Context, opts Options, id string, log *zap.Logger) error
+	DeregisterBackend(ctx context.Context, opts Options, id string, log *zap.Logger) error
+}
+
+// StateStore abstracts rollout state persistence for rollback support.
+type StateStore interface {
+	Save(state RolloutState) error
+	Clear(service string)
+}
+
+type runDeps struct {
+	runtime Runtime
+	control ControlAPI
+	state   StateStore
 }
 
 func statePath(service string) string {
@@ -146,6 +178,10 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 	}
 	defer unlock()
 
+	return runWithDeps(ctx, opts, log, defaultRunDeps())
+}
+
+func runWithDeps(ctx context.Context, opts Options, log *zap.Logger, deps runDeps) error {
 	log.Info("rollout: starting",
 		zap.String("service", opts.Service),
 		zap.String("compose", opts.ComposeFile))
@@ -153,24 +189,27 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 	// ── Step 1: Pull new image ────────────────────────────────────────────
 	if opts.Pull {
 		log.Info("rollout: pulling image", zap.String("service", opts.Service))
-		if err := composeRun(ctx, opts.ComposeFile, "pull", opts.Service); err != nil {
+		if err := deps.runtime.Pull(ctx, opts.ComposeFile, opts.Service); err != nil {
 			return fmt.Errorf("rollout: pull: %w", err)
 		}
 	}
 
 	// ── Step 2: Scale to +1 ───────────────────────────────────────────────
+	currentReplicas, err := deps.runtime.ServiceReplicaCount(ctx, opts.Service)
+	if err != nil {
+		return fmt.Errorf("rollout: detect current replicas: %w", err)
+	}
+	targetReplicas := currentReplicas + 1
 	log.Info("rollout: scaling +1", zap.String("service", opts.Service))
-	if err := composeRun(ctx, opts.ComposeFile, "up", "-d", "--no-deps",
-		"--scale", opts.Service+"=2", opts.Service); err != nil {
+	if err := deps.runtime.ScaleService(ctx, opts.ComposeFile, opts.Service, targetReplicas); err != nil {
 		return fmt.Errorf("rollout: scale up: %w", err)
 	}
 
 	// ── Step 3: Wait for healthcheck ──────────────────────────────────────
-	newID, newAddr, err := waitForNewContainer(ctx, opts, log)
+	newID, newAddr, err := deps.runtime.WaitForNewContainer(ctx, opts, log)
 	if err != nil {
 		// Cleanup: scale back down on healthcheck timeout.
-		_ = composeRun(ctx, opts.ComposeFile, "up", "-d", "--no-deps",
-			"--scale", opts.Service+"=1", opts.Service)
+		_ = deps.runtime.ScaleService(ctx, opts.ComposeFile, opts.Service, currentReplicas)
 		return fmt.Errorf("rollout: wait for healthy container: %w", err)
 	}
 
@@ -179,7 +218,7 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 		zap.String("addr", newAddr))
 
 	// ── Step 4: Find old container ID ────────────────────────────────────
-	oldID, err := findOldContainer(ctx, opts.Service, newID)
+	oldID, err := deps.runtime.FindOldContainer(ctx, opts.Service, newID)
 	if err != nil {
 		log.Warn("rollout: could not identify old container — skipping deregister",
 			zap.Error(err))
@@ -187,7 +226,7 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 
 	// ── Step 5: Register new backend with proxy ───────────────────────────
 	newBackendID := opts.Service + "-" + newID[:12]
-	if err := registerBackend(ctx, opts, newBackendID, newAddr, log); err != nil {
+	if err := deps.control.RegisterBackend(ctx, opts, newBackendID, newAddr, log); err != nil {
 		return fmt.Errorf("rollout: register new backend: %w", err)
 	}
 	log.Info("rollout: new backend registered",
@@ -199,11 +238,11 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 	oldAddr := ""
 	if oldID != "" {
 		oldBackendID = opts.Service + "-" + oldID[:12]
-		if addr, err := containerAddr(ctx, oldID); err == nil {
+		if addr, err := deps.runtime.ContainerAddr(ctx, oldID); err == nil {
 			oldAddr = addr
 		}
 	}
-	_ = saveState(RolloutState{
+	_ = deps.state.Save(RolloutState{
 		Service:      opts.Service,
 		OldBackendID: oldBackendID,
 		OldAddr:      oldAddr,
@@ -218,7 +257,9 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 	// ── Step 7: Drain old connections ─────────────────────────────────────
 	log.Info("rollout: draining old connections", zap.Duration("drain", opts.Drain))
 	if oldID != "" {
-		_ = drainBackend(ctx, opts, oldBackendID, log)
+		if err := deps.control.DrainBackend(ctx, opts, oldBackendID, log); err != nil {
+			return fmt.Errorf("rollout: drain old backend %s: %w", oldBackendID, err)
+		}
 	}
 	select {
 	case <-time.After(opts.Drain):
@@ -228,7 +269,7 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 
 	// ── Step 8: Deregister old backend ────────────────────────────────────
 	if oldID != "" {
-		if err := deregisterBackend(ctx, opts, oldBackendID, log); err != nil {
+		if err := deps.control.DeregisterBackend(ctx, opts, oldBackendID, log); err != nil {
 			log.Warn("rollout: could not deregister old backend",
 				zap.String("id", oldBackendID),
 				zap.Error(err))
@@ -242,12 +283,31 @@ func Run(ctx context.Context, opts Options, log *zap.Logger) error {
 	// we want.
 	if oldID != "" {
 		log.Info("rollout: removing old container", zap.String("id", oldID))
-		_ = exec.CommandContext(ctx, "docker", "stop", oldID).Run()
-		_ = exec.CommandContext(ctx, "docker", "rm", oldID).Run()
+		_ = deps.runtime.RemoveContainer(ctx, oldID)
+	} else if err := deps.runtime.ScaleService(ctx, opts.ComposeFile, opts.Service, currentReplicas); err != nil {
+		log.Warn("rollout: could not reconcile replica count",
+			zap.Int("target_replicas", currentReplicas),
+			zap.Error(err))
+	}
+
+	// ── Step 9b: Deregister seed backend ─────────────────────────────────
+	// The proxy is seeded with a DNS-based "<service>-default" backend via
+	// DPIVOT_TARGETS. After the first successful rollout the IP-based backend
+	// takes over, so the seed backend must be cleaned up — otherwise it stays
+	// in the rotation forever and routes traffic to whatever DNS resolves to
+	// at any given moment (which may be a stale or wrong container).
+	seedID := opts.Service + "-default"
+	if err := deps.control.DeregisterBackend(ctx, opts, seedID, log); err != nil {
+		// 404 = already gone; all other errors are non-fatal — log and continue.
+		log.Warn("rollout: could not deregister seed backend (non-fatal)",
+			zap.String("id", seedID),
+			zap.Error(err))
+	} else {
+		log.Info("rollout: seed backend deregistered", zap.String("id", seedID))
 	}
 
 	// ── Step 10: Clear state ──────────────────────────────────────────────
-	clearState(opts.Service)
+	deps.state.Clear(opts.Service)
 
 	log.Info("rollout: complete", zap.String("service", opts.Service))
 	return nil
@@ -317,6 +377,66 @@ func Rollback(ctx context.Context, state RolloutState, log *zap.Logger) error {
 
 // ── Docker / Compose helpers ──────────────────────────────────────────────────
 
+type dockerRuntime struct{}
+
+func (dockerRuntime) Pull(ctx context.Context, composeFile, service string) error {
+	return composeRun(ctx, composeFile, "pull", service)
+}
+
+func (dockerRuntime) ServiceReplicaCount(ctx context.Context, service string) (int, error) {
+	return serviceReplicaCount(ctx, service)
+}
+
+func (dockerRuntime) ScaleService(ctx context.Context, composeFile, service string, replicas int) error {
+	return scaleService(ctx, composeFile, service, replicas)
+}
+
+func (dockerRuntime) WaitForNewContainer(ctx context.Context, opts Options, log *zap.Logger) (id, addr string, err error) {
+	return waitForNewContainer(ctx, opts, log)
+}
+
+func (dockerRuntime) FindOldContainer(ctx context.Context, service, newID string) (string, error) {
+	return findOldContainer(ctx, service, newID)
+}
+
+func (dockerRuntime) ContainerAddr(ctx context.Context, id string) (string, error) {
+	return containerAddr(ctx, id)
+}
+
+func (dockerRuntime) RemoveContainer(ctx context.Context, id string) error {
+	if err := exec.CommandContext(ctx, "docker", "stop", id).Run(); err != nil {
+		return err
+	}
+	return exec.CommandContext(ctx, "docker", "rm", id).Run()
+}
+
+type httpControlAPI struct{}
+
+func (httpControlAPI) RegisterBackend(ctx context.Context, opts Options, id, addr string, log *zap.Logger) error {
+	return registerBackend(ctx, opts, id, addr, log)
+}
+
+func (httpControlAPI) DrainBackend(ctx context.Context, opts Options, id string, log *zap.Logger) error {
+	return drainBackend(ctx, opts, id, log)
+}
+
+func (httpControlAPI) DeregisterBackend(ctx context.Context, opts Options, id string, log *zap.Logger) error {
+	return deregisterBackend(ctx, opts, id, log)
+}
+
+type fileStateStore struct{}
+
+func (fileStateStore) Save(state RolloutState) error { return saveState(state) }
+func (fileStateStore) Clear(service string)          { clearState(service) }
+
+func defaultRunDeps() runDeps {
+	return runDeps{
+		runtime: dockerRuntime{},
+		control: httpControlAPI{},
+		state:   fileStateStore{},
+	}
+}
+
 func composeRun(ctx context.Context, file string, args ...string) error {
 	cmdArgs := append([]string{"compose", "-f", file}, args...)
 	cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
@@ -375,7 +495,7 @@ func inspectNewestHealthy(ctx context.Context, service string) (id, addr string,
 	// ExposedPorts is map[Port]struct{} so we range with $k,$v to get the key.
 	inspectOut, err := exec.CommandContext(ctx, "docker", "inspect",
 		"--format",
-		`{{.State.Health.Status}}{{range $n, $v := .NetworkSettings.Networks}} net={{$n}}={{$v.IPAddress}}{{end}}{{range $k, $v := .Config.ExposedPorts}} port={{$k}}{{end}}`,
+		`{{.State.Health.Status}}{{range $n, $v := .NetworkSettings.Networks}} net={{$n}}={{$v.IPAddress}}{{end}}{{range $k, $v := .Config.ExposedPorts}} port={{$k}}{{end}}{{range .Config.Env}} env={{.}}{{end}}`,
 		id,
 	).Output()
 	if err != nil {
@@ -396,12 +516,14 @@ func inspectNewestHealthy(ctx context.Context, service string) (id, addr string,
 	}
 
 	// Parse network and port tokens.
-	var netTokens, portTokens []string
+	var netTokens, portTokens, envTokens []string
 	for _, f := range fields[1:] {
 		if strings.HasPrefix(f, "net=") {
 			netTokens = append(netTokens, strings.TrimPrefix(f, "net="))
 		} else if strings.HasPrefix(f, "port=") {
 			portTokens = append(portTokens, strings.TrimPrefix(f, "port="))
+		} else if strings.HasPrefix(f, "env=") {
+			envTokens = append(envTokens, strings.TrimPrefix(f, "env="))
 		}
 	}
 
@@ -410,14 +532,9 @@ func inspectNewestHealthy(ctx context.Context, service string) (id, addr string,
 		return "", "", fmt.Errorf("container %s has no IP address", id)
 	}
 
-	// Extract the first exposed port number (format: "3001/tcp").
-	port := "80"
-	if len(portTokens) > 0 {
-		if p, _, found := strings.Cut(portTokens[0], "/"); found {
-			port = p
-		} else {
-			port = portTokens[0]
-		}
+	port, err := pickBackendPort(portTokens, envTokens)
+	if err != nil {
+		return "", "", fmt.Errorf("container %s port resolution failed: %w", id, err)
 	}
 
 	return id, ip + ":" + port, nil
@@ -444,33 +561,69 @@ func findOldContainer(ctx context.Context, service, newID string) (string, error
 func containerAddr(ctx context.Context, id string) (string, error) {
 	out, err := exec.CommandContext(ctx, "docker", "inspect",
 		"--format",
-		`{{range $n, $v := .NetworkSettings.Networks}}net={{$n}}={{$v.IPAddress}} {{end}}{{range $k, $v := .Config.ExposedPorts}}port={{$k}} {{end}}`,
+		`{{range $n, $v := .NetworkSettings.Networks}}net={{$n}}={{$v.IPAddress}} {{end}}{{range $k, $v := .Config.ExposedPorts}}port={{$k}} {{end}}{{range .Config.Env}}env={{.}} {{end}}`,
 		id,
 	).Output()
 	if err != nil {
 		return "", err
 	}
-	var netTokens, portTokens []string
+	var netTokens, portTokens, envTokens []string
 	for _, f := range strings.Fields(string(out)) {
 		if strings.HasPrefix(f, "net=") {
 			netTokens = append(netTokens, strings.TrimPrefix(f, "net="))
 		} else if strings.HasPrefix(f, "port=") {
 			portTokens = append(portTokens, strings.TrimPrefix(f, "port="))
+		} else if strings.HasPrefix(f, "env=") {
+			envTokens = append(envTokens, strings.TrimPrefix(f, "env="))
 		}
 	}
 	ip := pickMeshIP(netTokens)
 	if ip == "" {
 		return "", fmt.Errorf("container %s has no IP", id)
 	}
-	port := "80"
-	if len(portTokens) > 0 {
-		if p, _, found := strings.Cut(portTokens[0], "/"); found {
-			port = p
-		} else {
-			port = portTokens[0]
-		}
+	port, err := pickBackendPort(portTokens, envTokens)
+	if err != nil {
+		return "", fmt.Errorf("container %s port resolution failed: %w", id, err)
 	}
 	return ip + ":" + port, nil
+}
+
+func pickBackendPort(portTokens, envTokens []string) (string, error) {
+	// Prefer DPIVOT_BACKEND from container env because it's deterministic and
+	// reflects the intended target port from generation time.
+	for _, env := range envTokens {
+		if !strings.HasPrefix(env, "DPIVOT_BACKEND=") {
+			continue
+		}
+		backend := strings.TrimPrefix(env, "DPIVOT_BACKEND=")
+		_, port, found := strings.Cut(backend, ":")
+		if found && port != "" {
+			if _, err := strconv.Atoi(port); err == nil {
+				return port, nil
+			}
+		}
+	}
+
+	if len(portTokens) == 0 {
+		return "80", nil
+	}
+	ports := make([]int, 0, len(portTokens))
+	for _, token := range portTokens {
+		portStr := token
+		if p, _, found := strings.Cut(token, "/"); found {
+			portStr = p
+		}
+		p, err := strconv.Atoi(portStr)
+		if err != nil {
+			continue
+		}
+		ports = append(ports, p)
+	}
+	if len(ports) == 0 {
+		return "", fmt.Errorf("no parseable exposed ports in %v", portTokens)
+	}
+	sort.Ints(ports)
+	return strconv.Itoa(ports[0]), nil
 }
 
 // pickMeshIP selects the IP from the dpivot_mesh network out of a slice of
@@ -516,10 +669,27 @@ func registerBackend(ctx context.Context, opts Options, id, addr string, log *za
 		return fmt.Errorf("POST /backends: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
+	// 201 Created = registered; 409 Conflict = already registered (idempotent — safe to continue).
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusConflict {
 		return fmt.Errorf("POST /backends: unexpected status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func serviceReplicaCount(ctx context.Context, service string) (int, error) {
+	out, err := exec.CommandContext(ctx, "docker", "ps",
+		"--filter", "label=com.docker.compose.service="+service,
+		"--format", "{{.ID}}",
+	).Output()
+	if err != nil {
+		return 0, fmt.Errorf("docker ps: %w", err)
+	}
+	return len(strings.Fields(string(out))), nil
+}
+
+func scaleService(ctx context.Context, composeFile, service string, replicas int) error {
+	return composeRun(ctx, composeFile, "up", "-d", "--no-deps",
+		"--scale", fmt.Sprintf("%s=%d", service, replicas), service)
 }
 
 func drainBackend(ctx context.Context, opts Options, id string, log *zap.Logger) error {
@@ -536,6 +706,9 @@ func drainBackend(ctx context.Context, opts Options, id string, log *zap.Logger)
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("PUT /backends/%s/drain: unexpected status %d", id, resp.StatusCode)
+	}
 	return nil
 }
 
@@ -553,7 +726,8 @@ func deregisterBackend(ctx context.Context, opts Options, id string, log *zap.Lo
 		return fmt.Errorf("DELETE /backends/%s: %w", id, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
+	// 204 No Content = removed; 404 Not Found = already gone (idempotent — both are success).
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("DELETE /backends/%s: unexpected status %d", id, resp.StatusCode)
 	}
 	return nil

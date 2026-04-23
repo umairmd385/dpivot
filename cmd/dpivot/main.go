@@ -11,7 +11,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -263,11 +265,40 @@ Example:
   dpivot status
   dpivot status --control-addr http://localhost:9901`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			resp, err := doGet(controlAddr + "/backends")
+			raw, err := doGet(controlAddr + "/backends")
 			if err != nil {
-				return fmt.Errorf("status: %w", err)
+				return fmt.Errorf("status: %w\n\nHint: is the proxy running? Check: docker ps --filter name=dpivot-proxy", err)
 			}
-			fmt.Println(resp)
+
+			var result struct {
+				Backends []struct {
+					ID       string `json:"id"`
+					Addr     string `json:"addr"`
+					Draining bool   `json:"draining"`
+					Requests uint64 `json:"requests"`
+				} `json:"backends"`
+				Count int `json:"count"`
+			}
+			if err := json.Unmarshal([]byte(raw), &result); err != nil {
+				fmt.Println(raw)
+				return nil
+			}
+
+			fmt.Fprintf(os.Stderr, "Control API: %s\n\n", controlAddr)
+			if result.Count == 0 {
+				fmt.Println("No backends registered.")
+				return nil
+			}
+
+			fmt.Printf("%-36s  %-24s  %10s  %s\n", "BACKEND ID", "ADDRESS", "REQUESTS", "STATUS")
+			fmt.Println(strings.Repeat("─", 82))
+			for _, b := range result.Backends {
+				status := "active"
+				if b.Draining {
+					status = "draining"
+				}
+				fmt.Printf("%-36s  %-24s  %10d  %s\n", b.ID, b.Addr, b.Requests, status)
+			}
 			return nil
 		},
 	}
@@ -281,24 +312,12 @@ func scaleCmd(log *zap.Logger) *cobra.Command {
 	var opts rollout.Options
 
 	cmd := &cobra.Command{
-		Use:   "scale <service> <n>",
-		Short: "Register n replicas of a service with the proxy",
-		Long: `Scales a service to n replicas and registers each container with
-the dpivot proxy for round-robin load balancing.
-
-Example:
-  dpivot scale web 3`,
-		Args: cobra.ExactArgs(2),
+		Use:    "scale <service> <n>",
+		Short:  "Register n replicas of a service with the proxy",
+		Hidden: true, // not yet implemented; hidden so it doesn't appear in --help
+		Args:   cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			service := args[0]
-			n, err := strconv.Atoi(args[1])
-			if err != nil || n < 1 {
-				return fmt.Errorf("scale: %q is not a positive integer", args[1])
-			}
-			log.Info("scale: not yet implemented — use rollout for now",
-				zap.String("service", service),
-				zap.Int("n", n))
-			return nil
+			return fmt.Errorf("scale is not yet implemented — use 'dpivot rollout' to deploy new versions")
 		},
 	}
 	cmd.Flags().StringVarP(&opts.ComposeFile, "file", "f", "dpivot-compose.yml", "dpivot compose file")
@@ -434,9 +453,14 @@ func doGet(url string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	var buf strings.Builder
-	_, err = fmt.Fscan(resp.Body, &buf)
-	return buf.String(), err
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("GET %s: unexpected status %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return string(body), nil
 }
 
 var httpClient = &http.Client{Timeout: 5 * time.Second}

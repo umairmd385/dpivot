@@ -201,12 +201,18 @@ services:
 		t.Fatalf("Generate: %v", err)
 	}
 	proxy := out.Services["dpivot-proxy-frontend"]
-	if len(proxy.Ports) != 2 {
-		t.Errorf("multi-port proxy should have 2 ports, got %d: %v", len(proxy.Ports), proxy.Ports)
+	// 2 traffic ports (80:80, 443:443) + 1 control port (firstHostPort+6900 → 9900)
+	if len(proxy.Ports) != 3 {
+		t.Errorf("multi-port proxy should have 3 ports (2 traffic + 1 control), got %d: %v", len(proxy.Ports), proxy.Ports)
 	}
 	binds := proxy.Environment["DPIVOT_BINDS"]
 	if !strings.Contains(binds, "80") || !strings.Contains(binds, "443") {
 		t.Errorf("DPIVOT_BINDS = %q, want both port 80 and 443", binds)
+	}
+	// Control port should be 80+6900=6980 mapped to 9900
+	controlPort := proxy.Ports[len(proxy.Ports)-1]
+	if controlPort != "6980:9900" {
+		t.Errorf("control port mapping = %q, want 6980:9900", controlPort)
 	}
 }
 
